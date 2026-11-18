@@ -17,6 +17,8 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import java.io.File
 import java.io.FileOutputStream
 
@@ -27,6 +29,88 @@ class MainActivity : AppCompatActivity() {
     private val desktopUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    private val desktopSpoofScript = """
+        (function() {
+            try {
+                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
+                Object.defineProperty(navigator, 'userAgentData', {
+                    get: () => ({
+                        brands: [
+                            { brand: 'Google Chrome', version: '131' },
+                            { brand: 'Chromium', version: '131' },
+                            { brand: 'Not_A Brand', version: '24' }
+                        ],
+                        mobile: false,
+                        platform: 'Windows',
+                        getHighEntropyValues: async () => ({
+                            architecture: 'x86',
+                            bitness: '64',
+                            mobile: false,
+                            model: '',
+                            platform: 'Windows',
+                            platformVersion: '15.0.0',
+                            uaFullVersion: '131.0.0.0'
+                        })
+                    })
+                });
+                Object.defineProperty(window.screen, 'width', { get: () => 1920 });
+                Object.defineProperty(window.screen, 'height', { get: () => 1080 });
+                Object.defineProperty(window.screen, 'availWidth', { get: () => 1920 });
+                Object.defineProperty(window.screen, 'availHeight', { get: () => 1040 });
+            } catch (e) {}
+
+            const targetViewport = 'width=1440, initial-scale=0.35, user-scalable=yes';
+            function lockViewport() {
+                var meta = document.querySelector('meta[name="viewport"]');
+                if (!meta) {
+                    if (document.head) {
+                        meta = document.createElement('meta');
+                        meta.name = 'viewport';
+                        meta.content = targetViewport;
+                        document.head.appendChild(meta);
+                    }
+                } else if (meta.content !== targetViewport) {
+                    meta.content = targetViewport;
+                }
+            }
+
+            lockViewport();
+            const observer = new MutationObserver(lockViewport);
+            observer.observe(document.documentElement, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['content']
+            });
+
+            if (!window._blobHooked) {
+                window._blobHooked = true;
+                const origClick = HTMLAnchorElement.prototype.click;
+                HTMLAnchorElement.prototype.click = function() {
+                    if (this.href && this.href.startsWith('blob:')) {
+                        const filename = this.download || ('firefly_vector_' + Date.now() + '.svg');
+                        fetch(this.href)
+                            .then(r => r.blob())
+                            .then(blob => {
+                                const reader = new FileReader();
+                                reader.onloadend = function() {
+                                    AndroidDownloader.saveBase64File(
+                                        reader.result,
+                                        filename,
+                                        blob.type || 'image/svg+xml'
+                                    );
+                                };
+                                reader.readAsDataURL(blob);
+                            });
+                        return;
+                    }
+                    return origClick.apply(this, arguments);
+                };
+            }
+        })();
+    """.trimIndent()
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -39,6 +123,9 @@ class MainActivity : AppCompatActivity() {
         cookieManager.setAcceptCookie(true)
         cookieManager.setAcceptThirdPartyCookies(webView, true)
 
+        webView.clearCache(true)
+        webView.setInitialScale(30)
+
         webView.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -49,9 +136,13 @@ class MainActivity : AppCompatActivity() {
             setSupportZoom(true)
             builtInZoomControls = true
             displayZoomControls = false
-            cacheMode = WebSettings.LOAD_DEFAULT
+            cacheMode = WebSettings.LOAD_NO_CACHE
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(false)
+        }
+
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            WebViewCompat.addDocumentStartJavaScript(webView, desktopSpoofScript, setOf("*"))
         }
 
         webView.addJavascriptInterface(BlobDownloadBridge(), "AndroidDownloader")
@@ -66,40 +157,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
-                // Force 1280px desktop layout width & intercept blob SVG downloads
-                val js = """
-                    (function() {
-                        var meta = document.querySelector('meta[name="viewport"]');
-                        if (!meta) {
-                            meta = document.createElement('meta');
-                            meta.name = 'viewport';
-                            document.head.appendChild(meta);
-                        }
-                        meta.content = 'width=1280, initial-scale=0.5, user-scalable=yes';
-
-                        if (!window._blobHooked) {
-                            window._blobHooked = true;
-                            const origClick = HTMLAnchorElement.prototype.click;
-                            HTMLAnchorElement.prototype.click = function() {
-                                if (this.href && this.href.startsWith('blob:')) {
-                                    const filename = this.download || ('firefly_vector_' + Date.now() + '.svg');
-                                    fetch(this.href)
-                                        .then(r => r.blob())
-                                        .then(blob => {
-                                            const reader = new FileReader();
-                                            reader.onloadend = function() {
-                                                AndroidDownloader.saveBase64File(reader.result, filename, blob.type || 'image/svg+xml');
-                                            };
-                                            reader.readAsDataURL(blob);
-                                        });
-                                    return;
-                                }
-                                return origClick.apply(this, arguments);
-                            };
-                        }
-                    })();
-                """.trimIndent()
-                view?.evaluateJavascript(js, null)
+                view?.evaluateJavascript(desktopSpoofScript, null)
             }
         }
 
